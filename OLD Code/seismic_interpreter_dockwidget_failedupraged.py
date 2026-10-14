@@ -1,0 +1,1177 @@
+# -*- coding: utf-8 -*-
+"""
+/***************************************************************************
+ SeismicInterpreterDockWidget
+                                 A QGIS plugin
+ 2D SEG-Y Viewer and Horizon Picker for QGIS
+ ***************************************************************************/
+"""
+
+import os
+import json
+import sip
+import segyio
+import numpy as np
+import pyqtgraph as pg
+
+from qgis.PyQt.QtCore import pyqtSignal, Qt, QRectF, QMetaType
+from qgis.PyQt.QtWidgets import (
+    QDockWidget, QPushButton, QVBoxLayout, QWidget, 
+    QFileDialog, QLabel, QHBoxLayout, QComboBox, QCheckBox,
+    QDialog, QFormLayout, QDoubleSpinBox, QDialogButtonBox, QInputDialog,
+    QListWidget, QListWidgetItem, QGroupBox
+)
+from qgis.PyQt.QtGui import QColor
+from qgis.core import (
+    QgsVectorLayer, QgsMapLayer, QgsFeature, QgsGeometry, 
+    QgsPointXY, QgsPoint, QgsField, QgsProject, QgsWkbTypes,
+    QgsSingleSymbolRenderer, QgsMarkerSymbol, QgsLineSymbol,
+    QgsRenderContext, QgsSpatialIndex, QgsFeatureRequest, QgsApplication,
+    QgsVectorFileWriter, QgsFields, QgsCoordinateTransformContext
+)
+from qgis.gui import QgsRubberBand
+
+
+class ProfileSettingsDialog(QDialog):
+    """Dialog to control layer visibility and styling independently for the profile window."""
+    def __init__(self, available_layers, active_overrides, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Profile Window Overlays & Properties")
+        self.setMinimumWidth(400)
+        
+        self.available_layers = available_layers
+        self.overrides = active_overrides.copy()
+
+        layout = QVBoxLayout(self)
+
+        group_vis = QGroupBox("Select Profile Items")
+        vis_layout = QVBoxLayout(group_vis)
+        
+        self.list_widget = QListWidget()
+        for lyr_id, lyr_name in available_layers.items():
+            item = QListWidgetItem(lyr_name)
+            item.setData(Qt.UserRole, lyr_id)
+            
+            is_checked = self.overrides.get(lyr_id, {}).get('enabled', True)
+            item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
+            self.list_widget.addItem(item)
+            
+        vis_layout.addWidget(self.list_widget)
+        layout.addWidget(group_vis)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_settings(self):
+        result = {}
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            lyr_id = item.data(Qt.UserRole)
+            is_enabled = (item.checkState() == Qt.Checked)
+            result[lyr_id] = {'enabled': is_enabled}
+        return result
+
+
+class SegyImportDialog(QDialog):
+    """Dialog to inspect and override SEG-Y vertical domain parameters on import"""
+    def __init__(self, filename, auto_samples, auto_interval, auto_delay, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Import SEG-Y Scale - {filename}")
+        self.setMinimumWidth(380)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.combo_domain = QComboBox()
+        self.combo_domain.addItems([
+            "Two-Way Travel Time (ms)", 
+            "Two-Way Travel Time (s)", 
+            "Depth (m)", 
+            "Depth (ft)"
+        ])
+        form.addRow("Vertical Domain:", self.combo_domain)
+
+        self.spin_start = QDoubleSpinBox()
+        self.spin_start.setRange(-10000.0, 100000.0)
+        self.spin_start.setDecimals(2)
+        self.spin_start.setValue(float(auto_delay))
+        form.addRow("Start (Sample 0 Offset):", self.spin_start)
+
+        self.spin_interval = QDoubleSpinBox()
+        self.spin_interval.setRange(0.0001, 10000.0)
+        self.spin_interval.setDecimals(4)
+        self.spin_interval.setValue(float(auto_interval))
+        form.addRow("Sample Interval (\u0394t / \u0394z):", self.spin_interval)
+
+        self.lbl_samples = QLabel(str(auto_samples))
+        form.addRow("Trace Samples:", self.lbl_samples)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_settings(self):
+        return {
+            'domain': self.combo_domain.currentText(),
+            'start': self.spin_start.value(),
+            'interval': self.spin_interval.value()
+        }
+
+
+class SeismicInterpreterDockWidget(QDockWidget):
+
+    closingPlugin = pyqtSignal()
+
+    def __init__(self, iface, parent=None):
+        super(SeismicInterpreterDockWidget, self).__init__(parent)
+        self.iface = iface
+        self.setWindowTitle("Seismic Interpreter")
+
+        self._cleaned_up = False
+
+        self.seismic_data = {}
+        self.active_line = None
+        self.marker = None
+        self.map_layer = None
+        self.scatter_items = {} 
+        self.connected_layer_ids = set()
+        
+        self.last_pick = None 
+        self.profile_layer_overrides = {}
+        self.erase_roi = None
+
+        self.main_widget = QWidget()
+        self.layout = QVBoxLayout(self.main_widget)
+        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(4)
+
+        # Top Control Bar (Streamlined)
+        self.top_bar = QVBoxLayout()
+        self.top_bar.setSpacing(4)
+        
+        # Row 1: Line Management
+        row1 = QHBoxLayout()
+        self.btn_load = QPushButton("Open")
+        self.btn_load.setMaximumWidth(50)
+        self.btn_load.clicked.connect(self.select_segy_files)
+        row1.addWidget(self.btn_load)
+
+        self.combo_lines = QComboBox()
+        self.combo_lines.currentIndexChanged.connect(self.on_line_dropdown_changed)
+        row1.addWidget(self.combo_lines, stretch=1)
+
+        self.btn_profile_opts = QPushButton("⚙")
+        self.btn_profile_opts.setMaximumWidth(30)
+        self.btn_profile_opts.setToolTip("Configure Profile Display Items")
+        self.btn_profile_opts.clicked.connect(self.open_profile_settings)
+        row1.addWidget(self.btn_profile_opts)
+        
+        self.top_bar.addLayout(row1)
+
+        # Row 2: Horizon Management
+        row2 = QHBoxLayout()
+        self.btn_new_horizon = QPushButton("+Hz")
+        self.btn_new_horizon.setMaximumWidth(40)
+        self.btn_new_horizon.clicked.connect(self.create_new_horizon_layer)
+        row2.addWidget(self.btn_new_horizon)
+
+        self.combo_horizons = QComboBox()
+        row2.addWidget(self.combo_horizons, stretch=1)
+
+        self.chk_show_lines = QCheckBox("Lines")
+        self.chk_show_lines.setChecked(True)
+        self.chk_show_lines.stateChanged.connect(self.on_display_style_changed)
+        row2.addWidget(self.chk_show_lines)
+        
+        self.top_bar.addLayout(row2)
+
+        # Row 3: Picking & Tracking Modes
+        row3 = QHBoxLayout()
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems([
+            "Navigate", 
+            "Pick: Manual", 
+            "Pick: Interpolate", 
+            "Track: Peak", 
+            "Track: Trough", 
+            "Erase: Box"
+        ])
+        self.combo_mode.currentIndexChanged.connect(self.on_mode_changed)
+        
+        self.btn_apply_erase = QPushButton("Apply Erase")
+        self.btn_apply_erase.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+        self.btn_apply_erase.clicked.connect(self.apply_box_erase)
+        self.btn_apply_erase.setVisible(False)
+
+        row3.addWidget(QLabel("Mode:"))
+        row3.addWidget(self.combo_mode, stretch=1)
+        row3.addWidget(self.btn_apply_erase)
+
+        self.top_bar.addLayout(row3)
+
+        self.lbl_info = QLabel("No lines loaded")
+        self.lbl_info.setStyleSheet("color: #888; font-size: 11px;")
+        self.top_bar.addWidget(self.lbl_info)
+
+        self.layout.addLayout(self.top_bar)
+
+        # PyQtGraph Viewport Setup
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setMinimumWidth(100)
+        self.plot_widget.setBackground('k')
+        self.img_item = pg.ImageItem()
+        self.plot_widget.addItem(self.img_item)
+        
+        self.plot_widget.getViewBox().invertY(True)
+        self.plot_widget.setLabel('left', 'Vertical Axis')
+        self.plot_widget.setLabel('bottom', 'Trace Index')
+
+        pos = np.array([0.0, 0.5, 1.0])
+        color = np.array([[0, 0, 255, 255], [255, 255, 255, 255], [255, 0, 0, 255]], dtype=np.uint8)
+        cmap = pg.ColorMap(pos, color)
+        self.img_item.setLookupTable(cmap.getLookupTable())
+
+        self.layout.addWidget(self.plot_widget)
+        self.setWidget(self.main_widget)
+
+        self.plot_widget.scene().sigMouseClicked.connect(self.on_seismic_clicked)
+        self.init_map_layer()
+        self.refresh_horizon_dropdown()
+
+        proj = QgsProject.instance()
+        tree_root = proj.layerTreeRoot()
+        tree_root.willAddChildren.connect(self.on_project_layers_changed)
+        tree_root.willRemoveChildren.connect(self.on_project_layers_changed)
+        proj.layersAdded.connect(self.on_project_layers_changed)
+        proj.layersRemoved.connect(self.on_project_layers_changed)
+        tree_root.visibilityChanged.connect(self.on_layer_visibility_changed)
+        proj.readProject.connect(self.restore_state_from_project)
+        
+        try:
+            app = QgsApplication.instance()
+            if app and not sip.isdeleted(app):
+                app.aboutToQuit.connect(self.cleanup_resources)
+        except Exception as e:
+            pass
+
+    def on_project_layers_changed(self, *args):
+        """Handler triggered when project layers are added, removed, or changed."""
+        self.refresh_horizon_dropdown()
+        if self.active_line:
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def on_mode_changed(self):
+        mode = self.combo_mode.currentText()
+        self.last_pick = None  # Reset tracking state
+
+        if mode == "Erase: Box":
+            self.show_erase_box()
+            self.btn_apply_erase.setVisible(True)
+        else:
+            self.hide_erase_box()
+            self.btn_apply_erase.setVisible(False)
+
+    def show_erase_box(self):
+        if not self.erase_roi:
+            self.erase_roi = pg.RectROI([0, 0], [20, 100], pen=pg.mkPen('r', width=2), hoverPen=pg.mkPen('y', width=2))
+            self.plot_widget.addItem(self.erase_roi)
+        
+        vb = self.plot_widget.getViewBox()
+        vr = vb.viewRect()
+        self.erase_roi.setPos([vr.center().x() - 10, vr.center().y() - 50])
+        self.erase_roi.setSize([20, 100])
+        self.erase_roi.show()
+
+    def hide_erase_box(self):
+        if self.erase_roi:
+            self.erase_roi.hide()
+
+    def apply_box_erase(self):
+        if not self.erase_roi or not self.active_line: 
+            return
+            
+        pos = self.erase_roi.pos()
+        size = self.erase_roi.size()
+        min_tr, max_tr = min(pos.x(), pos.x() + size.x()), max(pos.x(), pos.x() + size.x())
+        min_val, max_val = min(pos.y(), pos.y() + size.y()), max(pos.y(), pos.y() + size.y())
+        
+        layer = self.get_active_horizon_layer()
+        if not layer: 
+            return
+            
+        features_to_delete = []
+        fields_map = {f.name().lower(): f.name() for f in layer.fields()}
+        line_fld = fields_map.get('linename') or fields_map.get('line_name') or fields_map.get('line')
+        trace_fld = fields_map.get('traceidx') or fields_map.get('trace_idx') or fields_map.get('trace')
+        val_fld = fields_map.get('value') or fields_map.get('val') or fields_map.get('z') or fields_map.get('time') or fields_map.get('depth')
+
+        if not (line_fld and trace_fld and val_fld):
+            return
+
+        req = QgsFeatureRequest().setFilterExpression(f'"{line_fld}" = \'{self.active_line}\'')
+
+        for feat in layer.getFeatures(req):
+            t_raw = feat.attribute(trace_fld)
+            v_raw = feat.attribute(val_fld)
+            if t_raw is not None and v_raw is not None:
+                try:
+                    t = float(t_raw)
+                    v = float(v_raw)
+                    if min_tr <= t <= max_tr and min_val <= v <= max_val:
+                        features_to_delete.append(feat.id())
+                except (ValueError, TypeError):
+                    continue
+                    
+        if features_to_delete:
+            layer.startEditing()
+            layer.deleteFeatures(features_to_delete)
+            layer.commitChanges()
+            layer.updateExtents()
+            layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def open_profile_settings(self):
+        layers = {}
+        for lyr_id, lyr in QgsProject.instance().mapLayers().items():
+            layers[lyr_id] = lyr.name()
+
+        dlg = ProfileSettingsDialog(layers, self.profile_layer_overrides, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.profile_layer_overrides = dlg.get_settings()
+            if self.active_line:
+                self.redraw_all_viewport_layers(self.active_line)
+
+    def on_display_style_changed(self, state):
+        if self.active_line:
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def save_state_to_project(self):
+        project = QgsProject.instance()
+        serialized_data = {}
+        for name, meta in self.seismic_data.items():
+            serialized_data[name] = {
+                'path': meta['path'],
+                'domain': meta['domain'],
+                'start': meta['start'],
+                'interval': meta['interval'],
+                'num_samples': meta['num_samples']
+            }
+        project.writeEntry("SeismicInterpreter", "loaded_lines", json.dumps(serialized_data))
+
+    def restore_state_from_project(self):
+        project = QgsProject.instance()
+        raw_json, ok = project.readEntry("SeismicInterpreter", "loaded_lines", "{}")
+        if ok and raw_json:
+            try:
+                data = json.loads(raw_json)
+                for line_name, meta in data.items():
+                    filepath = meta.get('path')
+                    if filepath and os.path.exists(filepath):
+                        self.load_segy_file(filepath, silent_settings=meta)
+            except Exception as e:
+                print(f"Failed to restore seismic project state: {e}")
+
+    def on_layer_visibility_changed(self, state=None, *args):
+        if hasattr(self, 'active_line') and self.active_line:
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def bind_layer_edit_signals(self, layer):
+        if layer and not sip.isdeleted(layer) and layer.id() not in self.connected_layer_ids:
+            layer.repaintRequested.connect(self.on_layer_data_changed)
+            if isinstance(layer, QgsVectorLayer):
+                layer.featureAdded.connect(self.on_layer_data_changed)
+                layer.featuresDeleted.connect(self.on_layer_data_changed)
+                layer.dataChanged.connect(self.on_layer_data_changed)
+            self.connected_layer_ids.add(layer.id())
+
+    def unbind_layer_edit_signals(self, layer):
+        if layer and not sip.isdeleted(layer) and layer.id() in self.connected_layer_ids:
+            try:
+                layer.repaintRequested.disconnect(self.on_layer_data_changed)
+            except (TypeError, RuntimeError):
+                pass
+            if isinstance(layer, QgsVectorLayer):
+                try:
+                    layer.featureAdded.disconnect(self.on_layer_data_changed)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    layer.featuresDeleted.disconnect(self.on_layer_data_changed)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    layer.dataChanged.disconnect(self.on_layer_data_changed)
+                except (TypeError, RuntimeError):
+                    pass
+            self.connected_layer_ids.remove(layer.id())
+
+    def on_layer_data_changed(self, *args):
+        if self.active_line:
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def get_project_crs(self):
+        return QgsProject.instance().crs()
+
+    def init_map_layer(self):
+        if self.map_layer is not None:
+            try:
+                if not sip.isdeleted(self.map_layer) and QgsProject.instance().mapLayer(self.map_layer.id()) is not None:
+                    return
+            except (RuntimeError, AttributeError):
+                pass
+            self.map_layer = None
+
+        for lyr in QgsProject.instance().mapLayers().values():
+            if lyr.name() == "Seismic Lines" and isinstance(lyr, QgsVectorLayer):
+                if lyr.dataProvider().name() == "ogr":
+                    self.map_layer = lyr
+                    try:
+                        self.map_layer.selectionChanged.disconnect(self.on_map_selection_changed)
+                    except Exception:
+                        pass
+                    self.map_layer.selectionChanged.connect(self.on_map_selection_changed)
+                    return
+
+        proj_path = QgsProject.instance().fileName()
+        save_dir = os.path.dirname(proj_path) if proj_path else os.path.expanduser("~")
+        gpkg_path = os.path.abspath(os.path.join(save_dir, "seismic_lines.gpkg"))
+
+        fields = QgsFields()
+        fields.append(QgsField("LineName", QMetaType.Type.QString))
+        crs = self.get_project_crs()
+
+        if not os.path.exists(gpkg_path):
+            writer_options = QgsVectorFileWriter.SaveVectorOptions()
+            writer_options.driverName = "GPKG"
+            writer_options.layerName = "Seismic Lines"
+            writer = QgsVectorFileWriter.create(
+                gpkg_path, fields, QgsWkbTypes.LineString, crs,
+                QgsCoordinateTransformContext(), writer_options
+            )
+            del writer
+
+        disk_layer = QgsVectorLayer(f"{gpkg_path}|layername=Seismic Lines", "Seismic Lines", "ogr")
+        if not disk_layer.isValid():
+            return
+
+        symbol = QgsLineSymbol.createSimple({'color': 'red', 'width': '0.6'})
+        disk_layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+        self.map_layer = QgsProject.instance().addMapLayer(disk_layer, True)
+        self.map_layer.selectionChanged.connect(self.on_map_selection_changed)
+
+    def find_all_horizon_layers(self):
+        horizon_layers = []
+        for layer in QgsProject.instance().mapLayers().values():
+            if isinstance(layer, QgsVectorLayer) and layer.geometryType() == QgsWkbTypes.PointGeometry:
+                field_names = [f.name().lower() for f in layer.fields()]
+                has_line = any(name in field_names for name in ['linename', 'line_name', 'line'])
+                has_trace = any(name in field_names for name in ['traceidx', 'trace_idx', 'trace'])
+                has_val = any(name in field_names for name in ['value', 'val', 'z', 'time', 'depth'])
+                if has_line and has_trace and has_val:
+                    horizon_layers.append(layer)
+        return horizon_layers
+
+    def refresh_horizon_dropdown(self):
+        self.combo_horizons.blockSignals(True)
+        self.combo_horizons.clear()
+        
+        layers = self.find_all_horizon_layers()
+        for lyr in layers:
+            self.combo_horizons.addItem(lyr.name(), userData=lyr.id())
+            self.bind_layer_edit_signals(lyr)
+
+        if not layers:
+            default_lyr = self.create_horizon_layer("Horizon_A")
+            self.combo_horizons.addItem(default_lyr.name(), userData=default_lyr.id())
+            self.bind_layer_edit_signals(default_lyr)
+
+        self.combo_horizons.blockSignals(False)
+
+    def get_active_horizon_layer(self):
+        lyr_id = self.combo_horizons.currentData()
+        if lyr_id:
+            return QgsProject.instance().mapLayer(lyr_id)
+        return None
+
+    def create_horizon_layer(self, layer_name, gpkg_path=None, color=QColor(255, 255, 0)):
+        if not gpkg_path:
+            proj_path = QgsProject.instance().fileName()
+            save_dir = os.path.dirname(proj_path) if proj_path else os.path.join(os.path.expanduser("~"), "SeismicData")
+            os.makedirs(save_dir, exist_ok=True)
+            sanitized_name = "".join(c for c in layer_name if c.isalnum() or c in ('_', '-'))
+            gpkg_path = os.path.join(save_dir, f"{sanitized_name}.gpkg")
+
+        fields = QgsFields()
+        fields.append(QgsField("HorizonName", QMetaType.Type.QString))
+        fields.append(QgsField("LineName", QMetaType.Type.QString))
+        fields.append(QgsField("TraceIdx", QMetaType.Type.Int))
+        fields.append(QgsField("Value", QMetaType.Type.Double))
+
+        crs = self.get_project_crs()
+        writer_options = QgsVectorFileWriter.SaveVectorOptions()
+        writer_options.driverName = "GPKG"
+        writer_options.layerName = layer_name
+
+        if not os.path.exists(gpkg_path):
+            writer = QgsVectorFileWriter.create(
+                gpkg_path, fields, QgsWkbTypes.PointZ, crs,
+                QgsCoordinateTransformContext(), writer_options
+            )
+            del writer
+
+        layer = QgsVectorLayer(f"{gpkg_path}|layername={layer_name}", layer_name, "ogr")
+        symbol = QgsMarkerSymbol.createSimple({'color': color.name(), 'size': '3'})
+        layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+        QgsProject.instance().addMapLayer(layer, True)
+        return layer
+
+    def create_new_horizon_layer(self):
+        text, ok = QInputDialog.getText(self, "New Horizon", "Enter Horizon Name:")
+        if not (ok and text.strip()):
+            return
+
+        layer_name = text.strip()
+        sanitized_name = "".join(c for c in layer_name if c.isalnum() or c in ('_', '-'))
+
+        proj_path = QgsProject.instance().fileName()
+        default_dir = os.path.dirname(proj_path) if proj_path else os.path.expanduser("~")
+        default_path = os.path.join(default_dir, f"{sanitized_name}.gpkg")
+
+        gpkg_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Horizon GeoPackage", default_path, "GeoPackage (*.gpkg)"
+        )
+        if not gpkg_path:
+            return
+
+        rand_color = QColor(np.random.randint(50, 255), np.random.randint(50, 255), np.random.randint(50, 255))
+        new_layer = self.create_horizon_layer(layer_name, gpkg_path=gpkg_path, color=rand_color)
+        
+        self.refresh_horizon_dropdown()
+        idx = self.combo_horizons.findData(new_layer.id())
+        if idx >= 0:
+            self.combo_horizons.setCurrentIndex(idx)
+
+        if self.active_line:
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def select_segy_files(self):
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self, "Select SEG-Y File(s)", "", "SEG-Y Files (*.sgy *.segy)"
+        )
+        for filepath in filepaths:
+            self.load_segy_file(filepath)
+
+    def load_segy_file(self, filepath, silent_settings=None):
+        self.init_map_layer()
+        line_name = os.path.splitext(os.path.basename(filepath))[0]
+        if line_name in self.seismic_data:
+            return
+
+        with segyio.open(filepath, ignore_geometry=True) as f:
+            x_raw = f.attributes(segyio.TraceField.SourceX)[:]
+            y_raw = f.attributes(segyio.TraceField.SourceY)[:]
+            scalars = f.attributes(segyio.TraceField.SourceGroupScalar)[:]
+
+            points = []
+            for x, y, s in zip(x_raw, y_raw, scalars):
+                factor = 1.0 / abs(s) if s < 0 else (float(s) if s > 0 else 1.0)
+                points.append(QgsPointXY(x * factor, y * factor))
+
+            dt_us = f.bin[segyio.BinField.Interval]
+            num_samples = f.bin[segyio.BinField.Samples]
+            start_delay = f.header[0][segyio.TraceField.DelayRecordingTime]
+            auto_interval = dt_us / 1000.0 if dt_us > 0 else 4.0
+
+        if silent_settings:
+            settings = silent_settings
+        else:
+            dlg = SegyImportDialog(line_name, num_samples, auto_interval, start_delay, self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            settings = dlg.get_settings()
+
+        feat = QgsFeature(self.map_layer.fields())
+        feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+        feat.setAttribute("LineName", line_name)
+
+        self.map_layer.startEditing()
+        added = self.map_layer.addFeature(feat)
+        self.map_layer.commitChanges()
+
+        self.map_layer.updateExtents()
+        self.map_layer.triggerRepaint()
+
+        feat_id = feat.id() if added else None
+
+        self.seismic_data[line_name] = {
+            'path': filepath,
+            'points': points,
+            'feature_id': feat_id,
+            'domain': settings['domain'],
+            'start': settings['start'],
+            'interval': settings['interval'],
+            'num_samples': num_samples
+        }
+
+        self.save_state_to_project()
+
+        self.combo_lines.blockSignals(True)
+        self.combo_lines.addItem(line_name)
+        self.combo_lines.blockSignals(False)
+
+        if len(self.seismic_data) == 1:
+            self.display_line(line_name)
+
+        self.iface.mapCanvas().setExtent(self.map_layer.extent())
+        self.iface.mapCanvas().refresh()
+
+    def sample_raster_along_line(self, raster_layer, line_pts):
+        provider = raster_layer.dataProvider()
+        x_vals, y_vals = [], []
+        for trace_idx, pt in enumerate(line_pts):
+            val, ok = provider.sample(pt, 1)
+            if ok and val is not None and not np.isnan(val):
+                x_vals.append(trace_idx)
+                y_vals.append(val)
+        return x_vals, y_vals
+
+    def sample_point_layer_along_line(self, point_layer, line_pts, max_distance=50.0):
+        spatial_index = QgsSpatialIndex(point_layer.getFeatures())
+        fields_map = {f.name().lower(): f.name() for f in point_layer.fields()}
+        z_field_name = (
+            fields_map.get('z') or fields_map.get('val') or fields_map.get('value') or 
+            fields_map.get('elevation') or fields_map.get('elev') or fields_map.get('height') or
+            fields_map.get('topo') or fields_map.get('depth')
+        )
+
+        picks = []
+        for trace_idx, line_pt in enumerate(line_pts):
+            nearest_ids = spatial_index.nearestNeighbor(line_pt, 1, max_distance)
+            if nearest_ids:
+                req = QgsFeatureRequest().setFilterFid(nearest_ids[0])
+                feat = next(point_layer.getFeatures(req), None)
+                if not feat:
+                    continue
+                geom = feat.geometry()
+                z_val = None
+                if geom.get() and QgsWkbTypes.hasZ(geom.wkbType()):
+                    z_val = geom.get().z()
+                elif z_field_name and feat.attribute(z_field_name) is not None:
+                    try:
+                        z_val = float(feat.attribute(z_field_name))
+                    except (ValueError, TypeError):
+                        pass
+
+                if z_val is not None:
+                    picks.append({'pos': (trace_idx, z_val)})
+        return picks
+
+    def sync_and_redraw_all_horizons(self, line_name):
+        if not line_name:
+            return
+
+        horizon_layers = self.find_all_horizon_layers()
+
+        for lyr in horizon_layers:
+            if not lyr.isValid():
+                continue
+
+            if lyr.id() in self.profile_layer_overrides:
+                if not self.profile_layer_overrides[lyr.id()].get('enabled', True):
+                    continue
+
+            fields_map = {f.name().lower(): f.name() for f in lyr.fields()}
+            line_fld = fields_map.get('linename') or fields_map.get('line_name') or fields_map.get('line')
+            trace_fld = fields_map.get('traceidx') or fields_map.get('trace_idx') or fields_map.get('trace')
+            val_fld = fields_map.get('value') or fields_map.get('val') or fields_map.get('z') or fields_map.get('time') or fields_map.get('depth')
+
+            if not (line_fld and trace_fld and val_fld):
+                continue
+
+            picks = []
+            req = QgsFeatureRequest().setFilterExpression(f'"{line_fld}" = \'{line_name}\'')
+            for feat in lyr.getFeatures(req):
+                raw_trace = feat.attribute(trace_fld)
+                raw_val = feat.attribute(val_fld)
+                if raw_trace is not None and raw_val is not None:
+                    try:
+                        t_idx = int(float(raw_trace))
+                        v_val = float(raw_val)
+                        picks.append((t_idx, v_val))
+                    except (ValueError, TypeError):
+                        continue
+
+            if picks:
+                picks.sort(key=lambda item: item[0])
+                color = QColor(255, 255, 0, 255)
+                try:
+                    renderer = lyr.renderer()
+                    if renderer:
+                        if hasattr(renderer, 'symbol') and renderer.symbol():
+                            color = renderer.symbol().color()
+                        elif hasattr(renderer, 'symbols') and renderer.symbols(QgsRenderContext()):
+                            color = renderer.symbols(QgsRenderContext())[0].color()
+                except Exception:
+                    pass
+
+                x_pts = [p[0] for p in picks]
+                y_pts = [p[1] for p in picks]
+
+                if self.chk_show_lines.isChecked():
+                    item = pg.PlotDataItem(
+                        x_pts, y_pts,
+                        pen=pg.mkPen(color, width=2),
+                        symbol='o', symbolSize=4,
+                        symbolBrush=pg.mkBrush(color)
+                    )
+                else:
+                    item = pg.ScatterPlotItem(
+                        size=8, 
+                        pen=pg.mkPen('k', width=0.5), 
+                        brush=pg.mkBrush(color.red(), color.green(), color.blue(), 255)
+                    )
+                    item.addPoints([{'pos': p} for p in picks])
+
+                item.setZValue(10)
+                if hasattr(self, 'plot_widget') and self.plot_widget and not sip.isdeleted(self.plot_widget):
+                    self.plot_widget.addItem(item)
+                    self.scatter_items[lyr.id()] = item
+
+    def sync_and_redraw_spatial_grid_overlays(self, line_name):
+        if not line_name or line_name not in self.seismic_data:
+            return
+
+        line_pts = self.seismic_data[line_name]['points']
+        horizon_layers = self.find_all_horizon_layers()
+        root = QgsProject.instance().layerTreeRoot()
+
+        for lyr_id, lyr in QgsProject.instance().mapLayers().items():
+            if lyr_id in self.profile_layer_overrides:
+                if not self.profile_layer_overrides[lyr_id].get('enabled', True):
+                    continue
+            else:
+                tree_node = root.findLayer(lyr.id())
+                if tree_node and not tree_node.isVisible():
+                    continue
+
+            if lyr in horizon_layers:
+                continue
+
+            self.bind_layer_edit_signals(lyr)
+
+            if lyr.type() == QgsMapLayer.RasterLayer and lyr.isValid():
+                x_vals, y_vals = self.sample_raster_along_line(lyr, line_pts)
+                if x_vals and y_vals:
+                    curve = pg.PlotCurveItem(
+                        x_vals, y_vals,
+                        pen=pg.mkPen(color='g', width=2, style=Qt.SolidLine),
+                        name=lyr.name()
+                    )
+                    curve.setZValue(12)
+                    if hasattr(self, 'plot_widget') and self.plot_widget and not sip.isdeleted(self.plot_widget):
+                        self.plot_widget.addItem(curve)
+                        self.scatter_items[f"raster_{lyr_id}"] = curve
+
+            elif lyr.type() == QgsMapLayer.VectorLayer and lyr.geometryType() == QgsWkbTypes.PointGeometry:
+                picks = self.sample_point_layer_along_line(lyr, line_pts, max_distance=50.0)
+                if picks:
+                    color = QColor(0, 255, 0, 255)
+                    try:
+                        renderer = lyr.renderer()
+                        if renderer and hasattr(renderer, 'symbol') and renderer.symbol():
+                            color = renderer.symbol().color()
+                    except Exception:
+                        pass
+
+                    scatter = pg.ScatterPlotItem(
+                        size=6,
+                        pen=pg.mkPen('k', width=0.5),
+                        brush=pg.mkBrush(color.red(), color.green(), color.blue(), 255)
+                    )
+                    scatter.setZValue(11)
+                    scatter.addPoints(picks)
+                    if hasattr(self, 'plot_widget') and self.plot_widget and not sip.isdeleted(self.plot_widget):
+                        self.plot_widget.addItem(scatter)
+                        self.scatter_items[f"vector_{lyr_id}"] = scatter
+
+    def redraw_all_viewport_layers(self, line_name):
+        if not hasattr(self, 'plot_widget') or not self.plot_widget or sip.isdeleted(self.plot_widget):
+            return
+
+        for item in self.scatter_items.values():
+            try:
+                if item and not sip.isdeleted(item):
+                    self.plot_widget.removeItem(item)
+            except Exception:
+                pass
+        self.scatter_items.clear()
+
+        if not line_name:
+            return
+
+        self.sync_and_redraw_all_horizons(line_name)
+        self.sync_and_redraw_spatial_grid_overlays(line_name)
+
+    def adjust_viewport_bounds(self):
+        if not self.active_line or not hasattr(self, 'plot_widget') or not self.plot_widget or sip.isdeleted(self.plot_widget):
+            return
+
+        meta = self.seismic_data[self.active_line]
+        start_y = meta['start']
+        interval_y = meta['interval']
+        num_samples = meta['num_samples']
+        
+        min_y = start_y
+        max_y = start_y + (num_samples * interval_y)
+
+        for item in self.scatter_items.values():
+            if isinstance(item, (pg.PlotCurveItem, pg.PlotDataItem)):
+                x_data, y_data = item.getData()
+                if y_data is not None and len(y_data) > 0:
+                    min_y = min(min_y, float(np.min(y_data)))
+                    max_y = max(max_y, float(np.max(y_data)))
+            elif isinstance(item, pg.ScatterPlotItem):
+                pts = item.points()
+                if pts is not None and len(pts) > 0:
+                    y_pts = [p.pos().y() for p in pts]
+                    min_y = min(min_y, float(min(y_pts)))
+                    max_y = max(max_y, float(max(y_pts)))
+
+        padding = abs(max_y - min_y) * 0.05
+        self.plot_widget.setYRange(min_y - padding, max_y + padding, padding=0)
+
+    def display_line(self, line_name):
+        if line_name not in self.seismic_data or not hasattr(self, 'plot_widget') or not self.plot_widget or sip.isdeleted(self.plot_widget):
+            return
+
+        self.active_line = line_name
+        meta = self.seismic_data[line_name]
+        filepath = meta['path']
+        
+        start_y = meta['start']
+        interval_y = meta['interval']
+        domain_str = meta['domain']
+
+        with segyio.open(filepath, ignore_geometry=True) as f:
+            data = segyio.tools.collect(f.trace[:])
+            num_traces, num_samples = data.shape
+            total_y_range = num_samples * interval_y
+            
+            self.img_item.setImage(data)
+            self.img_item.setRect(QRectF(0, start_y, num_traces, total_y_range))
+
+        self.plot_widget.setLabel('left', domain_str)
+        self.lbl_info.setText(f"Active: {line_name}")
+        
+        self.refresh_horizon_dropdown()
+        self.redraw_all_viewport_layers(line_name)
+        self.adjust_viewport_bounds()
+
+        idx = self.combo_lines.findText(line_name)
+        if idx >= 0 and self.combo_lines.currentIndex() != idx:
+            self.combo_lines.blockSignals(True)
+            self.combo_lines.setCurrentIndex(idx)
+            self.combo_lines.blockSignals(False)
+
+    def on_line_dropdown_changed(self, index):
+        line_name = self.combo_lines.itemText(index)
+        if line_name:
+            self.display_line(line_name)
+
+    def on_map_selection_changed(self, *args):
+        if not self.map_layer or sip.isdeleted(self.map_layer) or not self.map_layer.isValid():
+            return
+
+        selected_features = self.map_layer.selectedFeatures()
+        if not selected_features:
+            return
+
+        feature = selected_features[0]
+        if feature.isValid():
+            line_name = feature.attribute("LineName")
+            if line_name in self.seismic_data and line_name != self.active_line:
+                self.display_line(line_name)
+
+    def perform_auto_track(self, start_trace, start_val, mode):
+        meta = self.seismic_data[self.active_line]
+        
+        start_y = meta['start']
+        interval_y = meta['interval']
+        data = self.img_item.image
+        if data is None: 
+            return [(start_trace, start_val)]
+            
+        num_traces, num_samples = data.shape
+        picks = []
+        is_peak = (mode == "Track: Peak")
+
+        def find_extremum(tr_idx, seed_sample, window=5):
+            if tr_idx < 0 or tr_idx >= num_traces: 
+                return None
+            s0 = max(0, int(seed_sample - window))
+            s1 = min(num_samples, int(seed_sample + window + 1))
+            trace_data = data[tr_idx, s0:s1]
+            if len(trace_data) == 0: 
+                return None
+            
+            idx = np.argmax(trace_data) if is_peak else np.argmin(trace_data)
+            return s0 + idx
+
+        init_sample = (start_val - start_y) / interval_y
+        snapped_sample = find_extremum(start_trace, init_sample, window=3)
+        
+        if snapped_sample is None: 
+            return [(start_trace, start_val)]
+        
+        picks.append((start_trace, start_y + snapped_sample * interval_y))
+        
+        curr_sample = snapped_sample
+        for t in range(start_trace + 1, min(start_trace + 75, num_traces)):
+            next_sample = find_extremum(t, curr_sample, window=3)
+            if next_sample is None: break
+            curr_sample = next_sample
+            picks.append((t, start_y + curr_sample * interval_y))
+            
+        curr_sample = snapped_sample
+        for t in range(start_trace - 1, max(start_trace - 75, -1), -1):
+            next_sample = find_extremum(t, curr_sample, window=3)
+            if next_sample is None: break
+            curr_sample = next_sample
+            picks.append((t, start_y + curr_sample * interval_y))
+            
+        return picks
+
+    def on_seismic_clicked(self, event):
+        if not self.active_line:
+            return
+
+        pos = event.scenePos()
+        mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+        trace_idx = int(round(mouse_point.x()))
+        val_y = mouse_point.y()
+
+        points = self.seismic_data[self.active_line]['points']
+        mode = self.combo_mode.currentText()
+        active_layer = self.get_active_horizon_layer()
+
+        if 0 <= trace_idx < len(points):
+            
+            if event.button() == Qt.RightButton and mode not in ["Navigate", "Erase: Box"]:
+                event.accept()
+                if active_layer:
+                    self.delete_nearest_pick(active_layer, trace_idx, val_y)
+                return
+
+            if event.button() == Qt.LeftButton:
+                if mode in ["Navigate", "Erase: Box"]:
+                    self.highlight_map_location(points[trace_idx])
+                    return
+                    
+                if active_layer:
+                    picks_to_add = []
+                    
+                    if mode == "Pick: Interpolate" and self.last_pick is not None:
+                        t0, v0 = self.last_pick
+                        t1, v1 = trace_idx, val_y
+                        step = 1 if t1 >= t0 else -1
+                        for t in range(t0 + step, t1 + step, step):
+                            interp_v = v0 + (v1 - v0) * ((t - t0) / float(t1 - t0))
+                            picks_to_add.append((t, interp_v))
+                    
+                    elif mode in ["Track: Peak", "Track: Trough"]:
+                        picks_to_add = self.perform_auto_track(trace_idx, val_y, mode)
+                    else:
+                        picks_to_add.append((trace_idx, val_y))
+
+                    self.last_pick = (trace_idx, val_y)
+
+                    active_layer.startEditing()
+                    fields_map = {f.name().lower(): f.name() for f in active_layer.fields()}
+
+                    for t_i, v_i in picks_to_add:
+                        if t_i < 0 or t_i >= len(points): continue
+                        
+                        map_pt = points[t_i]
+                        feat = QgsFeature(active_layer.fields())
+                        feat.setGeometry(QgsGeometry.fromPoint(QgsPoint(map_pt.x(), map_pt.y(), float(v_i))))
+                        
+                        if 'horizonname' in fields_map:
+                            feat.setAttribute(fields_map['horizonname'], active_layer.name())
+                        if 'linename' in fields_map:
+                            feat.setAttribute(fields_map['linename'], self.active_line)
+                        if 'traceidx' in fields_map:
+                            feat.setAttribute(fields_map['traceidx'], int(t_i))
+                        if 'value' in fields_map:
+                            feat.setAttribute(fields_map['value'], float(v_i))
+
+                        active_layer.addFeature(feat)
+
+                    active_layer.commitChanges()
+                    active_layer.updateExtents()
+                    active_layer.triggerRepaint()
+                    self.iface.mapCanvas().refresh()
+
+                    self.redraw_all_viewport_layers(self.active_line)
+
+    def delete_nearest_pick(self, layer, target_trace, target_val):
+        meta = self.seismic_data[self.active_line]
+        interval_y = meta.get('interval', 4.0)
+        
+        trace_tol = 3
+        val_tol = interval_y * 3.0
+
+        features_to_delete = []
+
+        fields_map = {f.name().lower(): f.name() for f in layer.fields()}
+        line_fld = fields_map.get('linename') or fields_map.get('line_name') or fields_map.get('line')
+        trace_fld = fields_map.get('traceidx') or fields_map.get('trace_idx') or fields_map.get('trace')
+        val_fld = fields_map.get('value') or fields_map.get('val') or fields_map.get('z') or fields_map.get('time') or fields_map.get('depth')
+
+        if not (line_fld and trace_fld and val_fld):
+            return
+
+        req = QgsFeatureRequest().setFilterExpression(f'"{line_fld}" = \'{self.active_line}\'')
+
+        for feat in layer.getFeatures(req):
+            f_trace = feat.attribute(trace_fld)
+            f_val = feat.attribute(val_fld)
+            if f_trace is not None and f_val is not None:
+                try:
+                    if abs(int(float(f_trace)) - target_trace) <= trace_tol and abs(float(f_val) - target_val) <= val_tol:
+                        features_to_delete.append(feat.id())
+                except (ValueError, TypeError):
+                    continue
+
+        if features_to_delete:
+            layer.startEditing()
+            layer.deleteFeatures(features_to_delete)
+            layer.commitChanges()
+            
+            layer.updateExtents()
+            layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+
+            self.redraw_all_viewport_layers(self.active_line)
+
+    def highlight_map_location(self, point):
+        if self.marker is None or sip.isdeleted(self.marker):
+            self.marker = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PointGeometry)
+            self.marker.setColor(QColor(255, 0, 0))
+            self.marker.setIconSize(12)
+
+        self.marker.setToGeometry(QgsGeometry.fromPointXY(point), None)
+
+    def cleanup_resources(self):
+        if getattr(self, '_cleaned_up', False):
+            return
+        self._cleaned_up = True
+
+        self.blockSignals(True)
+
+        try:
+            app = QgsApplication.instance()
+            if app and not sip.isdeleted(app):
+                app.aboutToQuit.disconnect(self.cleanup_resources)
+        except (TypeError, RuntimeError):
+            pass
+
+        proj = QgsProject.instance()
+        if proj and not sip.isdeleted(proj):
+            try:
+                proj.layersAdded.disconnect(self.on_project_layers_changed)
+                proj.layersRemoved.disconnect(self.on_project_layers_changed)
+                proj.readProject.disconnect(self.restore_state_from_project)
+            except (TypeError, RuntimeError):
+                pass
+
+            try:
+                tree_root = proj.layerTreeRoot()
+                if tree_root and not sip.isdeleted(tree_root):
+                    tree_root.willAddChildren.disconnect(self.on_project_layers_changed)
+                    tree_root.willRemoveChildren.disconnect(self.on_project_layers_changed)
+                    tree_root.visibilityChanged.disconnect(self.on_layer_visibility_changed)
+            except (TypeError, RuntimeError):
+                pass
+
+            for lyr_id in list(self.connected_layer_ids):
+                lyr = proj.mapLayer(lyr_id)
+                if lyr and not sip.isdeleted(lyr):
+                    self.unbind_layer_edit_signals(lyr)
+        self.connected_layer_ids.clear()
+
+        if hasattr(self, 'map_layer') and self.map_layer and not sip.isdeleted(self.map_layer):
+            try:
+                self.map_layer.selectionChanged.disconnect(self.on_map_selection_changed)
+            except (TypeError, RuntimeError):
+                pass
+
+        if getattr(self, 'marker', None) and not sip.isdeleted(self.marker):
+            try:
+                canvas = self.iface.mapCanvas() if self.iface else None
+                if canvas and not sip.isdeleted(canvas) and canvas.scene():
+                    canvas.scene().removeItem(self.marker)
+            except Exception:
+                pass
+            self.marker = None
+
+        if hasattr(self, 'plot_widget') and self.plot_widget and not sip.isdeleted(self.plot_widget):
+            try:
+                scene = self.plot_widget.scene()
+                if scene and not sip.isdeleted(scene):
+                    scene.sigMouseClicked.disconnect(self.on_seismic_clicked)
+            except (TypeError, RuntimeError):
+                pass
+            
+            if hasattr(self, 'erase_roi') and self.erase_roi and not sip.isdeleted(self.erase_roi):
+                try:
+                    self.plot_widget.removeItem(self.erase_roi)
+                except Exception:
+                    pass
+                self.erase_roi = None
+
+            for item in list(self.scatter_items.values()):
+                try:
+                    if item and not sip.isdeleted(item):
+                        self.plot_widget.removeItem(item)
+                except Exception:
+                    pass
+            self.scatter_items.clear()
+
+            if hasattr(self, 'img_item') and self.img_item and not sip.isdeleted(self.img_item):
+                try:
+                    self.plot_widget.removeItem(self.img_item)
+                except Exception:
+                    pass
+                self.img_item = None
+
+            try:
+                self.plot_widget.clear()
+                if self.layout:
+                    self.layout.removeWidget(self.plot_widget)
+                self.plot_widget.setParent(None)
+                self.plot_widget.close()
+                self.plot_widget.deleteLater()
+            except Exception:
+                pass
+            self.plot_widget = None
+
+        self.seismic_data.clear()
+        self.active_line = None
+
+        try:
+            self.setParent(None)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        self.cleanup_resources()
+        self.closingPlugin.emit()
+        super().closeEvent(event)
