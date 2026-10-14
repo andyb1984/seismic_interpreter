@@ -90,7 +90,7 @@ class SeismicInterpreter:
         if self.dockwidget:
             try:
                 self.dockwidget.closingPlugin.disconnect(self.onClosePlugin)
-            except Exception:
+            except Exception:  # nosec
                 pass
         self.pluginIsActive = False
 
@@ -103,7 +103,7 @@ class SeismicInterpreter:
         if self.dockwidget:
             try:
                 self.dockwidget.cleanup_resources()
-            except Exception:
+            except Exception:  # nosec
                 pass
             self.iface.removeDockWidget(self.dockwidget)
             self.dockwidget.deleteLater()

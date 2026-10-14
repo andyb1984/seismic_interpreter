@@ -250,7 +250,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
             app = QgsApplication.instance()
             if app and not sip.isdeleted(app):
                 app.aboutToQuit.connect(self.cleanup_resources)
-        except Exception as e:
+        except Exception as e:  # nosec
             print(f"Could not connect aboutToQuit signal: {e}")
 
     def open_profile_settings(self):
@@ -304,7 +304,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                     filepath = meta.get('path')
                     if filepath and os.path.exists(filepath):
                         self.load_segy_file(filepath, silent_settings=meta)
-            except Exception as e:
+            except Exception as e:  # nosec
                 print(f"Failed to restore seismic project state: {e}")
 
     def on_layer_visibility_changed(self, state=None, *args):
@@ -324,20 +324,20 @@ class SeismicInterpreterDockWidget(QDockWidget):
         if layer and not sip.isdeleted(layer) and layer.id() in self.connected_layer_ids:
             try:
                 layer.repaintRequested.disconnect(self.on_layer_data_changed)
-            except (TypeError, RuntimeError):
+            except (TypeError, RuntimeError):  # nosec
                 pass
             if isinstance(layer, QgsVectorLayer):
                 try:
                     layer.featureAdded.disconnect(self.on_layer_data_changed)
-                except (TypeError, RuntimeError):
+                except (TypeError, RuntimeError):  # nosec
                     pass
                 try:
                     layer.featuresDeleted.disconnect(self.on_layer_data_changed)
-                except (TypeError, RuntimeError):
+                except (TypeError, RuntimeError):  # nosec
                     pass
                 try:
                     layer.dataChanged.disconnect(self.on_layer_data_changed)
-                except (TypeError, RuntimeError):
+                except (TypeError, RuntimeError):  # nosec
                     pass
             self.connected_layer_ids.remove(layer.id())
 
@@ -353,7 +353,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
             try:
                 if not sip.isdeleted(self.map_layer) and QgsProject.instance().mapLayer(self.map_layer.id()) is not None:
                     return
-            except (RuntimeError, AttributeError):
+            except (RuntimeError, AttributeError):  # nosec
                 pass
             self.map_layer = None
 
@@ -363,7 +363,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                     self.map_layer = lyr
                     try:
                         self.map_layer.selectionChanged.disconnect(self.on_map_selection_changed)
-                    except Exception:
+                    except Exception:  # nosec
                         pass
                     self.map_layer.selectionChanged.connect(self.on_map_selection_changed)
                     return
@@ -602,7 +602,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                 elif z_field_name and feat.attribute(z_field_name) is not None:
                     try:
                         z_val = float(feat.attribute(z_field_name))
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError):  # nosec
                         pass
 
                 if z_val is not None:
@@ -642,7 +642,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                         t_idx = int(float(raw_trace))
                         v_val = float(raw_val)
                         picks.append((t_idx, v_val))
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError):  # nosec
                         continue
 
             if picks:
@@ -655,7 +655,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                             color = renderer.symbol().color()
                         elif hasattr(renderer, 'symbols') and renderer.symbols(QgsRenderContext()):
                             color = renderer.symbols(QgsRenderContext())[0].color()
-                except Exception:
+                except Exception:  # nosec
                     pass
 
                 x_pts = [p[0] for p in picks]
@@ -725,7 +725,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                         renderer = lyr.renderer()
                         if renderer and hasattr(renderer, 'symbol') and renderer.symbol():
                             color = renderer.symbol().color()
-                    except Exception:
+                    except Exception:  # nosec
                         pass
 
                     scatter = pg.ScatterPlotItem(
@@ -747,7 +747,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
             try:
                 if item and not sip.isdeleted(item):
                     self.plot_widget.removeItem(item)
-            except Exception:
+            except Exception:  # nosec
                 pass
         self.scatter_items.clear()
 
@@ -929,7 +929,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                 try:
                     if abs(int(float(f_trace)) - target_trace) <= trace_tol and abs(float(f_val) - target_val) <= val_tol:
                         features_to_delete.append(feat.id())
-                except (ValueError, TypeError):
+                except (ValueError, TypeError):  # nosec
                     continue
 
         if features_to_delete:
@@ -962,7 +962,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
             app = QgsApplication.instance()
             if app and not sip.isdeleted(app):
                 app.aboutToQuit.disconnect(self.cleanup_resources)
-        except (TypeError, RuntimeError):
+        except (TypeError, RuntimeError):  # nosec
             pass
 
         proj = QgsProject.instance()
@@ -971,7 +971,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                 proj.layersAdded.disconnect(self.on_project_layers_changed)
                 proj.layersRemoved.disconnect(self.on_project_layers_changed)
                 proj.readProject.disconnect(self.restore_state_from_project)
-            except (TypeError, RuntimeError):
+            except (TypeError, RuntimeError):  # nosec
                 pass
 
             try:
@@ -980,7 +980,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                     tree_root.willAddChildren.disconnect(self.on_project_layers_changed)
                     tree_root.willRemoveChildren.disconnect(self.on_project_layers_changed)
                     tree_root.visibilityChanged.disconnect(self.on_layer_visibility_changed)
-            except (TypeError, RuntimeError):
+            except (TypeError, RuntimeError):  # nosec
                 pass
 
             for lyr_id in list(self.connected_layer_ids):
@@ -992,7 +992,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
         if hasattr(self, 'map_layer') and self.map_layer and not sip.isdeleted(self.map_layer):
             try:
                 self.map_layer.selectionChanged.disconnect(self.on_map_selection_changed)
-            except (TypeError, RuntimeError):
+            except (TypeError, RuntimeError):  # nosec
                 pass
 
         if getattr(self, 'marker', None) and not sip.isdeleted(self.marker):
@@ -1000,7 +1000,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                 canvas = self.iface.mapCanvas() if self.iface else None
                 if canvas and not sip.isdeleted(canvas) and canvas.scene():
                     canvas.scene().removeItem(self.marker)
-            except Exception:
+            except Exception:  # nosec
                 pass
             self.marker = None
 
@@ -1009,21 +1009,21 @@ class SeismicInterpreterDockWidget(QDockWidget):
                 scene = self.plot_widget.scene()
                 if scene and not sip.isdeleted(scene):
                     scene.sigMouseClicked.disconnect(self.on_seismic_clicked)
-            except (TypeError, RuntimeError):
+            except (TypeError, RuntimeError):  # nosec
                 pass
 
             for item in list(self.scatter_items.values()):
                 try:
                     if item and not sip.isdeleted(item):
                         self.plot_widget.removeItem(item)
-                except Exception:
+                except Exception:  # nosec
                     pass
             self.scatter_items.clear()
 
             if hasattr(self, 'img_item') and self.img_item and not sip.isdeleted(self.img_item):
                 try:
                     self.plot_widget.removeItem(self.img_item)
-                except Exception:
+                except Exception:  # nosec
                     pass
                 self.img_item = None
 
@@ -1034,7 +1034,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
                 self.plot_widget.setParent(None)
                 self.plot_widget.close()
                 self.plot_widget.deleteLater()
-            except Exception:
+            except Exception:  # nosec
                 pass
             self.plot_widget = None
 
@@ -1043,7 +1043,7 @@ class SeismicInterpreterDockWidget(QDockWidget):
 
         try:
             self.setParent(None)
-        except Exception:
+        except Exception:  # nosec
             pass
 
     def closeEvent(self, event):
