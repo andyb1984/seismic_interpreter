@@ -8,7 +8,7 @@ qgisMinimumVersion=3.0
 description=2D SEG-Y Viewer and Horizon Picker for QGIS
 version=0.1
 author=Andrew Botsford
-email=andrewbotsford45@hotmailcom
+email=andrewbotsford45@hotmail.com
 
 about=Provide a brief description of the plugin and its purpose.
 
