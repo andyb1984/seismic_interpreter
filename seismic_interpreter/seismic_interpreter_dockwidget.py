@@ -15,7 +15,7 @@ import segyio
 import numpy as np
 import pyqtgraph as pg
 
-from qgis.PyQt.QtCore import pyqtSignal, Qt, QRectF, QMetaType
+from qgis.PyQt.QtCore import pyqtSignal, Qt, QRectF, QMetaType, QVariant
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QPushButton, QVBoxLayout, QWidget, 
     QFileDialog, QLabel, QHBoxLayout, QComboBox, QCheckBox,
@@ -28,7 +28,7 @@ from qgis.core import (
     QgsPointXY, QgsPoint, QgsField, QgsProject, QgsWkbTypes,
     QgsSingleSymbolRenderer, QgsMarkerSymbol, QgsLineSymbol,
     QgsRenderContext, QgsSpatialIndex, QgsFeatureRequest, QgsApplication,
-    QgsVectorFileWriter, QgsFields, QgsCoordinateTransformContext
+    QgsVectorFileWriter, QgsFields, QgsCoordinateTransformContext, Qgis
 )
 from qgis.gui import QgsRubberBand
 
@@ -372,8 +372,17 @@ class SeismicInterpreterDockWidget(QDockWidget):
         save_dir = os.path.dirname(proj_path) if proj_path else os.path.expanduser("~")
         gpkg_path = os.path.abspath(os.path.join(save_dir, "seismic_lines.gpkg"))
 
+        # Version-safe string type determination
+        try:
+            string_type = QMetaType.Type.QString
+        except AttributeError:
+            try:
+                string_type = QMetaType.QString
+            except AttributeError:
+                string_type = QVariant.String
+
         fields = QgsFields()
-        fields.append(QgsField("LineName", QMetaType.Type.QString))
+        fields.append(QgsField("LineName", string_type))
         crs = self.get_project_crs()
 
         if not os.path.exists(gpkg_path):
@@ -443,11 +452,26 @@ class SeismicInterpreterDockWidget(QDockWidget):
             sanitized_name = "".join(c for c in layer_name if c.isalnum() or c in ('_', '-'))
             gpkg_path = os.path.join(save_dir, f"{sanitized_name}.gpkg")
 
+        # Version-safe field type determination
+        try:
+            str_type = QMetaType.Type.QString
+            int_type = QMetaType.Type.Int
+            dbl_type = QMetaType.Type.Double
+        except AttributeError:
+            try:
+                str_type = QMetaType.QString
+                int_type = QMetaType.Int
+                dbl_type = QMetaType.Double
+            except AttributeError:
+                str_type = QVariant.String
+                int_type = QVariant.Int
+                dbl_type = QVariant.Double
+
         fields = QgsFields()
-        fields.append(QgsField("HorizonName", QMetaType.Type.QString))
-        fields.append(QgsField("LineName", QMetaType.Type.QString))
-        fields.append(QgsField("TraceIdx", QMetaType.Type.Int))
-        fields.append(QgsField("Value", QMetaType.Type.Double))
+        fields.append(QgsField("HorizonName", str_type))
+        fields.append(QgsField("LineName", str_type))
+        fields.append(QgsField("TraceIdx", int_type))
+        fields.append(QgsField("Value", dbl_type))
 
         crs = self.get_project_crs()
         writer_options = QgsVectorFileWriter.SaveVectorOptions()
